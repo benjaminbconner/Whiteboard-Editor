@@ -1,0 +1,541 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Whiteboard Editor (Interactive)</title>
+  <style>
+    body { margin:0; display:flex; flex-direction:column; align-items:center; font-family:sans-serif; }
+    .toolbar { margin:10px; display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
+    canvas { border:2px solid #333; background:#fff; cursor:crosshair; }
+    button, select, input { padding:6px 10px; }
+    .sep { width:1px; height:24px; background:#ccc; margin:0 6px; }
+  </style>
+</head>
+<body>
+  <div class="toolbar">
+    <strong>Tool:</strong>
+    <button id="tool-pen">Pen (P)</button>
+    <button id="tool-rect">Rect (R)</button>
+    <button id="tool-circle">Circle (C)</button>
+    <button id="tool-line">Line (L)</button>
+    <button id="tool-select">Select (S)</button>
+    <span class="sep"></span>
+    <strong>Style:</strong>
+    <input type="color" id="stroke" value="#000000" />
+    <input type="color" id="fill" value="#ff7f50" />
+    <label><input type="checkbox" id="fill-enabled" /> Fill</label>
+    <input type="range" id="width" min="1" max="20" value="2" />
+    <span class="sep"></span>
+    <strong>Layers/Groups:</strong>
+    <button id="group">Group (G)</button>
+    <button id="ungroup">Ungroup (U)</button>
+    <button id="bring-forward">Bring Forward (])</button>
+    <button id="send-backward">Send Backward ([)</button>
+    <span class="sep"></span>
+    <button id="clear">Clear</button>
+  </div>
+
+  <canvas id="canvas" width="900" height="600"></canvas>
+
+  <script>
+    const canvas = document.getElementById('canvas');
+    const ctx = canvas.getContext('2d');
+
+    // Tools: pen draws rasterized strokes; shapes are vector objects
+    const TOOLS = { PEN:'pen', RECT:'rect', CIRCLE:'circle', LINE:'line', SELECT:'select' };
+    let tool = TOOLS.PEN;
+
+    // Style controls
+    const strokeInput = document.getElementById('stroke');
+    const fillInput = document.getElementById('fill');
+    const fillEnabledInput = document.getElementById('fill-enabled');
+    const widthInput = document.getElementById('width');
+
+    // Data model
+    const shapes = []; // vector shapes
+    const strokes = []; // raster pen paths (each path: {points:[], stroke, width, z})
+    let zCounter = 0;
+
+    // Selection
+    let selectedIds = new Set();
+    let selectionRect = null;
+    let draggingSelection = false;
+    let dragStart = null;
+
+    // Resize/move
+    let activeShapeId = null;
+    let activeHandle = null; // {name, x, y}
+    let isDraggingShape = false;
+
+    // Drawing new shapes
+    let startPoint = null; // {x,y} when starting a shape or pen path
+    let activePenPath = null;
+
+    // Utility
+    function nextZ() { return ++zCounter; }
+    function getMouse(e) {
+      const r = canvas.getBoundingClientRect();
+      return { x: e.clientX - r.left, y: e.clientY - r.top };
+    }
+    function dist(a,b,c,d){ return Math.hypot(a-c, b-d); }
+
+    // Rendering
+    function draw() {
+      ctx.clearRect(0,0,canvas.width,canvas.height);
+
+      // Render in z order: strokes + shapes
+      const items = [
+        ...strokes.map(s=>({type:'stroke', z:s.z, obj:s})),
+        ...shapes.map(s=>({type:'shape', z:s.z, obj:s}))
+      ].sort((a,b)=>a.z - b.z);
+
+      for (const item of items) {
+        if (item.type === 'stroke') {
+          const s = item.obj;
+          ctx.strokeStyle = s.stroke;
+          ctx.lineWidth = s.width;
+          ctx.lineJoin = 'round';
+          ctx.lineCap = 'round';
+          ctx.beginPath();
+          if (s.points.length) {
+            ctx.moveTo(s.points[0].x, s.points[0].y);
+            for (let i=1;i<s.points.length;i++){
+              ctx.lineTo(s.points[i].x, s.points[i].y);
+            }
+          }
+          ctx.stroke();
+        } else {
+          const s = item.obj;
+          ctx.lineWidth = s.width;
+          ctx.strokeStyle = s.stroke;
+          ctx.beginPath();
+          if (s.type==='rect') {
+            ctx.rect(s.x, s.y, s.w, s.h);
+            if (s.fillEnabled) { ctx.fillStyle = s.fill; ctx.fill(); }
+            ctx.stroke();
+          } else if (s.type==='circle') {
+            ctx.arc(s.cx, s.cy, s.r, 0, Math.PI*2);
+            if (s.fillEnabled) { ctx.fillStyle = s.fill; ctx.fill(); }
+            ctx.stroke();
+          } else if (s.type==='line') {
+            ctx.moveTo(s.x1, s.y1);
+            ctx.lineTo(s.x2, s.y2);
+            ctx.stroke();
+          }
+          // selection outline + handles
+          if (selectedIds.has(s.id)) {
+            drawSelectionOutlineAndHandles(s);
+          }
+        }
+      }
+
+      // selection rectangle (multi-select)
+      if (selectionRect) {
+        ctx.setLineDash([6,4]);
+        ctx.strokeStyle = 'royalblue';
+        ctx.lineWidth = 1;
+        ctx.strokeRect(selectionRect.x, selectionRect.y, selectionRect.w, selectionRect.h);
+        ctx.setLineDash([]);
+      }
+    }
+
+    function drawSelectionOutlineAndHandles(s) {
+      ctx.save();
+      ctx.setLineDash([5,3]);
+      ctx.strokeStyle = 'royalblue';
+      ctx.lineWidth = 1;
+
+      const bb = getBoundingBox(s);
+      ctx.strokeRect(bb.x, bb.y, bb.w, bb.h);
+
+      ctx.setLineDash([]);
+      ctx.fillStyle = 'royalblue';
+      const handles = getHandles(s);
+      for (const h of handles) {
+        ctx.fillRect(h.x-4, h.y-4, 8, 8);
+      }
+      ctx.restore();
+    }
+
+    // Bounding boxes and handles
+    function getBoundingBox(s) {
+      if (s.type==='rect') return { x:s.x, y:s.y, w:s.w, h:s.h };
+      if (s.type==='circle') return { x:s.cx - s.r, y:s.cy - s.r, w: 2*s.r, h: 2*s.r };
+      if (s.type==='line') {
+        const x = Math.min(s.x1, s.x2);
+        const y = Math.min(s.y1, s.y2);
+        const w = Math.abs(s.x2 - s.x1);
+        const h = Math.abs(s.y2 - s.y1);
+        return { x, y, w, h };
+      }
+      return {x:0,y:0,w:0,h:0};
+    }
+
+    function getHandles(s) {
+      if (s.type==='rect') {
+        return [
+          {name:'tl', x:s.x,        y:s.y},
+          {name:'tr', x:s.x+s.w,    y:s.y},
+          {name:'bl', x:s.x,        y:s.y+s.h},
+          {name:'br', x:s.x+s.w,    y:s.y+s.h}
+        ];
+      }
+      if (s.type==='circle') {
+        return [
+          {name:'r', x:s.cx + s.r, y:s.cy} // radius handle to the right
+        ];
+      }
+      if (s.type==='line') {
+        return [
+          {name:'p1', x:s.x1, y:s.y1},
+          {name:'p2', x:s.x2, y:s.y2}
+        ];
+      }
+      return [];
+    }
+
+    function hitHandle(s, x, y) {
+      const handles = getHandles(s);
+      return handles.find(h => Math.abs(h.x - x) <= 6 && Math.abs(h.y - y) <= 6) || null;
+    }
+
+    // Hit testing shapes
+    function hitShape(x, y) {
+      // Check top-most first: reverse z order
+      const ordered = [...shapes].sort((a,b)=>b.z - a.z);
+      for (const s of ordered) {
+        if (s.type==='rect') {
+          if (x>=s.x && x<=s.x+s.w && y>=s.y && y<=s.y+s.h) return s;
+        } else if (s.type==='circle') {
+          if (dist(x,y,s.cx,s.cy) <= s.r) return s;
+        } else if (s.type==='line') {
+          const d = pointToSegmentDistance(x,y,s.x1,s.y1,s.x2,s.y2);
+          if (d <= Math.max(6, s.width/2)) return s;
+        }
+      }
+      return null;
+    }
+
+    function pointToSegmentDistance(px,py,x1,y1,x2,y2){
+      const vx = x2 - x1, vy = y2 - y1;
+      const wx = px - x1, wy = py - y1;
+      const c1 = vx*wx + vy*wy;
+      if (c1 <= 0) return Math.hypot(px-x1, py-y1);
+      const c2 = vx*vx + vy*vy;
+      if (c2 <= c1) return Math.hypot(px-x2, py-y2);
+      const b = c1 / c2;
+      const bx = x1 + b*vx, by = y1 + b*vy;
+      return Math.hypot(px-bx, py-by);
+    }
+
+    // Mouse events
+    canvas.addEventListener('mousedown', (e) => {
+      const {x,y} = getMouse(e);
+      dragStart = {x,y};
+      activeHandle = null;
+      activeShapeId = null;
+      isDraggingShape = false;
+
+      if (tool === TOOLS.SELECT) {
+        const hit = hitShape(x,y);
+        if (hit) {
+          // Prioritize handle if clicked
+          const handle = hitHandle(hit, x, y);
+          activeShapeId = hit.id;
+          if (!selectedIds.has(hit.id)) {
+            selectedIds = new Set([hit.id]);
+          }
+          if (handle) {
+            activeHandle = handle;
+          } else {
+            // start moving shape(s)
+            isDraggingShape = true;
+          }
+        } else {
+          // Start selection box
+          selectionRect = {x, y, w:0, h:0};
+          draggingSelection = true;
+          selectedIds.clear();
+        }
+      } else if (tool === TOOLS.PEN) {
+        activePenPath = {
+          points: [{x,y}],
+          stroke: strokeInput.value,
+          width: Number(widthInput.value),
+          z: nextZ()
+        };
+        strokes.push(activePenPath);
+      } else {
+        // Begin drawing a new shape
+        startPoint = {x,y};
+      }
+
+      draw();
+    });
+
+    canvas.addEventListener('mousemove', (e) => {
+      const {x,y} = getMouse(e);
+
+      if (tool === TOOLS.SELECT) {
+        if (activeHandle && activeShapeId != null) {
+          const s = shapes.find(ss=>ss.id===activeShapeId);
+          if (s.type==='rect') {
+            if (activeHandle.name==='tl') {
+              const nx = x, ny = y;
+              s.w = s.x + s.w - nx;
+              s.h = s.y + s.h - ny;
+              s.x = nx; s.y = ny;
+            } else if (activeHandle.name==='tr') {
+              s.w = x - s.x;
+              const ny = y;
+              s.h = s.y + s.h - ny;
+              s.y = ny;
+            } else if (activeHandle.name==='bl') {
+              const nx = x;
+              s.w = s.x + s.w - nx;
+              s.x = nx;
+              s.h = y - s.y;
+            } else if (activeHandle.name==='br') {
+              s.w = x - s.x;
+              s.h = y - s.y;
+            }
+          } else if (s.type==='circle') {
+            s.r = Math.max(1, dist(x,y,s.cx,s.cy));
+          } else if (s.type==='line') {
+            if (activeHandle.name==='p1') { s.x1 = x; s.y1 = y; }
+            else if (activeHandle.name==='p2') { s.x2 = x; s.y2 = y; }
+          }
+          draw();
+        } else if (isDraggingShape && selectedIds.size) {
+          const dx = x - dragStart.x;
+          const dy = y - dragStart.y;
+          dragStart = {x,y};
+          for (const id of selectedIds) {
+            const s = shapes.find(ss=>ss.id===id);
+            if (s.type==='rect') { s.x += dx; s.y += dy; }
+            else if (s.type==='circle') { s.cx += dx; s.cy += dy; }
+            else if (s.type==='line') { s.x1 += dx; s.y1 += dy; s.x2 += dx; s.y2 += dy; }
+          }
+          draw();
+        } else if (draggingSelection && selectionRect) {
+          selectionRect.w = x - selectionRect.x;
+          selectionRect.h = y - selectionRect.y;
+          draw();
+        }
+      } else if (tool === TOOLS.PEN) {
+        if (activePenPath) {
+          activePenPath.points.push({x,y});
+          draw();
+        }
+      } else if (startPoint) {
+        // live preview (ghost) via redraw + temp shape on top
+        draw();
+        ctx.save();
+        ctx.setLineDash([6,4]);
+        ctx.strokeStyle = strokeInput.value;
+        ctx.lineWidth = Number(widthInput.value);
+        if (tool === TOOLS.RECT) {
+          ctx.beginPath();
+          ctx.rect(startPoint.x, startPoint.y, x - startPoint.x, y - startPoint.y);
+          if (fillEnabledInput.checked) {
+            ctx.fillStyle = fillInput.value;
+            ctx.fill();
+          }
+          ctx.stroke();
+        } else if (tool === TOOLS.CIRCLE) {
+          const r = dist(startPoint.x, startPoint.y, x, y);
+          ctx.beginPath();
+          ctx.arc(startPoint.x, startPoint.y, r, 0, Math.PI*2);
+          if (fillEnabledInput.checked) {
+            ctx.fillStyle = fillInput.value;
+            ctx.fill();
+          }
+          ctx.stroke();
+        } else if (tool === TOOLS.LINE) {
+          ctx.beginPath();
+          ctx.moveTo(startPoint.x, startPoint.y);
+          ctx.lineTo(x, y);
+          ctx.stroke();
+        }
+        ctx.restore();
+      }
+    });
+
+    canvas.addEventListener('mouseup', (e) => {
+      const {x,y} = getMouse(e);
+
+      if (tool === TOOLS.SELECT) {
+        if (draggingSelection && selectionRect) {
+          // Normalize rect
+          const rx = Math.min(selectionRect.x, selectionRect.x + selectionRect.w);
+          const ry = Math.min(selectionRect.y, selectionRect.y + selectionRect.h);
+          const rw = Math.abs(selectionRect.w);
+          const rh = Math.abs(selectionRect.h);
+
+          selectedIds.clear();
+          for (const s of shapes) {
+            const bb = getBoundingBox(s);
+            if (bb.x >= rx && bb.y >= ry && (bb.x+bb.w) <= (rx+rw) && (bb.y+bb.h) <= (ry+rh)) {
+              selectedIds.add(s.id);
+            }
+          }
+          selectionRect = null;
+          draggingSelection = false;
+          draw();
+        }
+        activeHandle = null;
+        isDraggingShape = false;
+        activeShapeId = null;
+      } else if (tool === TOOLS.PEN) {
+        activePenPath = null;
+      } else if (startPoint) {
+        // finalize shape
+        if (tool === TOOLS.RECT) {
+          const s = {
+            id: crypto.randomUUID(),
+            type:'rect',
+            x: startPoint.x,
+            y: startPoint.y,
+            w: x - startPoint.x,
+            h: y - startPoint.y,
+            stroke: strokeInput.value,
+            fill: fillInput.value,
+            fillEnabled: fillEnabledInput.checked,
+            width: Number(widthInput.value),
+            z: nextZ(),
+            group: null
+          };
+          shapes.push(s);
+          selectedIds = new Set([s.id]);
+        } else if (tool === TOOLS.CIRCLE) {
+          const r = Math.max(1, dist(startPoint.x, startPoint.y, x, y));
+          const s = {
+            id: crypto.randomUUID(),
+            type:'circle',
+            cx: startPoint.x,
+            cy: startPoint.y,
+            r,
+            stroke: strokeInput.value,
+            fill: fillInput.value,
+            fillEnabled: fillEnabledInput.checked,
+            width: Number(widthInput.value),
+            z: nextZ(),
+            group: null
+          };
+          shapes.push(s);
+          selectedIds = new Set([s.id]);
+        } else if (tool === TOOLS.LINE) {
+          const s = {
+            id: crypto.randomUUID(),
+            type:'line',
+            x1: startPoint.x,
+            y1: startPoint.y,
+            x2: x,
+            y2: y,
+            stroke: strokeInput.value,
+            width: Number(widthInput.value),
+            z: nextZ(),
+            group: null
+          };
+          shapes.push(s);
+          selectedIds = new Set([s.id]);
+        }
+        startPoint = null;
+        draw();
+      }
+    });
+
+    // Toolbar tool buttons
+    document.getElementById('tool-pen').onclick = () => tool = TOOLS.PEN;
+    document.getElementById('tool-rect').onclick = () => tool = TOOLS.RECT;
+    document.getElementById('tool-circle').onclick = () => tool = TOOLS.CIRCLE;
+    document.getElementById('tool-line').onclick = () => tool = TOOLS.LINE;
+    document.getElementById('tool-select').onclick = () => tool = TOOLS.SELECT;
+
+    // Keyboard shortcuts
+    document.addEventListener('keydown', (e) => {
+      const k = e.key.toLowerCase();
+      if (k==='p') tool = TOOLS.PEN;
+      else if (k==='r') tool = TOOLS.RECT;
+      else if (k==='c') tool = TOOLS.CIRCLE;
+      else if (k==='l') tool = TOOLS.LINE;
+      else if (k==='s') tool = TOOLS.SELECT;
+      else if (k==='g') groupSelected();
+      else if (k==='u') ungroupSelected();
+      else if (e.key===']') bringForwardSelected();
+      else if (e.key==='[') sendBackwardSelected();
+    });
+
+    // Grouping helpers
+    function groupSelected() {
+      if (selectedIds.size <= 1) return;
+      const gid = Date.now().toString();
+      for (const id of selectedIds) {
+        const s = shapes.find(ss=>ss.id===id);
+        if (s) s.group = gid;
+      }
+      draw();
+    }
+    function ungroupSelected() {
+      for (const id of selectedIds) {
+        const s = shapes.find(ss=>ss.id===id);
+        if (s) s.group = null;
+      }
+      draw();
+    }
+    function bringForwardSelected() {
+      const topZ = Math.max(0, ...shapes.map(s=>s.z));
+      for (const id of selectedIds) {
+        const s = shapes.find(ss=>ss.id===id);
+        if (s) s.z = topZ + 1;
+      }
+      draw();
+    }
+    function sendBackwardSelected() {
+      const bottomZ = Math.min(0, ...shapes.map(s=>s.z));
+      for (const id of selectedIds) {
+        const s = shapes.find(ss=>ss.id===id);
+        if (s) s.z = bottomZ - 1;
+      }
+      draw();
+    }
+
+    // Hook up buttons
+    document.getElementById('group').onclick = groupSelected;
+    document.getElementById('ungroup').onclick = ungroupSelected;
+    document.getElementById('bring-forward').onclick = bringForwardSelected;
+    document.getElementById('send-backward').onclick = sendBackwardSelected;
+
+    // Clear
+    document.getElementById('clear').onclick = () => {
+      shapes.length = 0;
+      strokes.length = 0;
+      selectedIds.clear();
+      selectionRect = null;
+      draw();
+    };
+
+    // Seed a couple shapes for testing
+    function seed() {
+      shapes.push({
+        id: crypto.randomUUID(),
+        type:'rect', x:120, y:120, w:160, h:110,
+        stroke:'#333', fill:'#f5c542', fillEnabled:true, width:2, z:nextZ(), group:null
+      });
+      shapes.push({
+        id: crypto.randomUUID(),
+        type:'circle', cx:420, cy:210, r:70,
+        stroke:'#333', fill:'#6ac1ff', fillEnabled:true, width:3, z:nextZ(), group:null
+      });
+      shapes.push({
+        id: crypto.randomUUID(),
+        type:'line', x1:650, y1:110, x2:820, y2:260,
+        stroke:'#333', width:4, z:nextZ(), group:null
+      });
+      draw();
+    }
+    seed();
+  </script>
+</body>
+</html>
+
